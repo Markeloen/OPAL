@@ -1,0 +1,30 @@
+{
+  "simulation_params": {
+    "num_steps": 3000,
+    "time_per_tick": 0.001,
+    "seed": 20260716
+  },
+  "channel_params": {
+    "phase_screen_size": 512,
+    "pixel_size": 0.01,
+    "num_layers": 10,
+    "total_r0": 0.25,
+    "wavefront_wavelength": 1.55e-06,
+    "L0": 25.0,
+    "ground_wind_speed": 5.0,
+    "satellite_orbit": 700000.0,
+    "satellite_zenith": 0.0
+  },
+  "pass_params": {
+    "altitude_m": 700000.0,
+    "min_elevation_deg": 20.0,
+    "num_segments": 30,
+    "pass_num_samples": 1024,
+    "pass_window_s": null,
+    "wavefront_captures": 200,
+    "capture_to_host": true,
+    "regenerate_on_switch": false,
+    "match_initial_r0": true,
+    "validation_guard_frac": 0.0
+  }
+}
