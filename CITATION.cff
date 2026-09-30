@@ -1,0 +1,38 @@
+cff-version: 1.2.0
+message: "If you use OPAL in your research, please cite it as below."
+title: "OPAL: a GPU-accelerated multilayer atmospheric turbulence simulator for space-to-ground optical links"
+type: software
+authors:
+  - family-names: Akhlaghi
+    given-names: Hamed
+    email: hamedak1999@gmail.com
+    affiliation: "Department of Electrical and Computer Engineering, McMaster University"
+  - family-names: Taylor
+    given-names: Michael
+    affiliation: "Department of Electrical and Computer Engineering, McMaster University"
+  - family-names: Hranilovic
+    given-names: Steve
+    affiliation: "Department of Electrical and Computer Engineering, McMaster University"
+repository-code: "https://github.com/Markeloen/OPAL"
+license: MIT
+version: 1.0.0
+keywords:
+  - atmospheric turbulence
+  - free-space optical communication
+  - satellite downlink
+  - phase screens
+  - GPU
+  - TensorFlow
+preferred-citation:
+  type: conference-paper
+  title: "OPAL: a GPU-accelerated multilayer atmospheric turbulence simulator for space-to-ground optical links"
+  authors:
+    - family-names: Akhlaghi
+      given-names: Hamed
+    - family-names: Taylor
+      given-names: Michael
+    - family-names: Hranilovic
+      given-names: Steve
+  conference:
+    name: "International Conference on Space Optics (ICSO)"
+  year: 2026
