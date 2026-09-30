@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opal-sim"
+dynamic = ["version"]
+description = "OPAL: GPU-accelerated multilayer atmospheric turbulence simulator for space-to-ground optical links"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Hamed Akhlaghi", email = "hamedak1999@gmail.com" }]
+keywords = [
+    "atmospheric turbulence",
+    "wave optics",
+    "free-space optical communication",
+    "satellite",
+    "phase screen",
+    "GPU",
+    "TensorFlow",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+    "numpy>=1.22",
+    "scipy>=1.8",
+    "numba>=0.56",
+    "psutil>=5.8",
+]
+
+[project.optional-dependencies]
+# TensorFlow is optional on purpose: on Windows the GPU build must come from
+# conda (see environment.yml), and pip would otherwise pull a CPU-only wheel.
+tf = ["tensorflow>=2.10"]
+viewer = ["matplotlib>=3.5"]
+all = ["tensorflow>=2.10", "matplotlib>=3.5", "gputil>=1.4"]
+
+[project.scripts]
+opal = "opal.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Markeloen/OPAL"
+Documentation = "https://github.com/Markeloen/OPAL#readme"
+Issues = "https://github.com/Markeloen/OPAL/issues"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = { attr = "opal._version.__version__" }

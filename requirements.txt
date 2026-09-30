@@ -1,0 +1,9 @@
+# Core runtime (TensorFlow is installed separately; see README "Installation").
+numpy>=1.22,<1.25
+scipy>=1.8
+numba>=0.56
+psutil>=5.8
+
+# Optional
+gputil>=1.4        # GPU total-memory query (nvidia-smi is used as a fallback)
+matplotlib>=3.5    # `opal view`

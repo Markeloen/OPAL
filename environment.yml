@@ -1,0 +1,20 @@
+# Native Windows GPU environment (TensorFlow 2.10 is the last release with
+# native Windows CUDA support). On Linux you can instead use a plain venv with
+# `pip install "tensorflow[and-cuda]"` followed by `pip install -e .`.
+name: opal
+channels:
+  - conda-forge
+dependencies:
+  - python=3.9
+  - cudatoolkit=11.2
+  - cudnn=8.1.0
+  - pip
+  - pip:
+      - "tensorflow<2.11"
+      - "numpy>=1.22,<1.25"
+      - "scipy>=1.8"
+      - "numba>=0.56"
+      - "psutil>=5.8"
+      - "gputil>=1.4"
+      - "matplotlib>=3.5"
+      - "-e ."
