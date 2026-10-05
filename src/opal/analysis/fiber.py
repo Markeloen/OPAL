@@ -102,51 +102,92 @@ def remove_tilt_com(wavefronts, pixel_scale, aperture_diameter=None, pad_factor=
     return corrected, tilts
 
 
-def compute_fiber_coupling(wavefronts, pixel_scale, a=1.12, aperture_diameter=None):
+@lru_cache(maxsize=8)
+def _coupling_kernel(n, pixel_scale, a, aperture_diameter):
+    """Cached aperture mask + conjugate fiber mode, cropped to the aperture's bounding box."""
+    mode, aperture_diameter, omega_0 = gaussian_fiber_mode((n, n), pixel_scale, a,
+                                                           aperture_diameter=aperture_diameter)
+    radius_px = float(aperture_diameter) / (2.0 * float(pixel_scale))
+    mask = circular_mask((n, n), radius=radius_px)
+    rows, cols = np.flatnonzero(mask.any(axis=1)), np.flatnonzero(mask.any(axis=0))
+    box = (slice(int(rows[0]), int(rows[-1]) + 1), slice(int(cols[0]), int(cols[-1]) + 1))
+    dA = float(pixel_scale) ** 2
+    mode_masked = mode * mask
+    for arr in (mask, mode_masked):
+        arr.setflags(write=False)
+    return {
+        "mask": mask,
+        "mode_masked": mode_masked,
+        "box": box,
+        "mask_box": mask[box].astype(np.float64),
+        "conj_mode_box": np.conj(mode_masked[box]),
+        "mode_power": float(np.sum(np.abs(mode) ** 2) * dA),
+        "dA": dA,
+        "aperture_diameter": float(aperture_diameter),
+        "omega_0": float(omega_0),
+    }
+
+
+def compute_fiber_coupling(wavefronts, pixel_scale, a=1.12, aperture_diameter=None, *,
+                           batch_size=None, max_batch_bytes=256 * 1024**2):
     """Single-mode coupling efficiency of complex fields ``[frames, N, N]``.
 
     The overlap runs over the receiver aperture while the fiber mode is
     normalised to unit power over the full plane (Dikmelik & Davidson Eqs. 1, 5).
 
-    Returns a dict with ``eta`` per frame, the aperture ``mask``, the masked
-    ``mode``, ``aperture_diameter`` and ``omega_0``.
+    ``wavefronts`` may be an in-memory array, a memory-mapped ``.npy`` or a
+    :class:`opal.frames.FrameSeries`. Frames are processed in batches of at
+    most ``max_batch_bytes`` (complex128, aperture box only), so memory use
+    does not grow with the number of frames.
+
+    Returns a dict with ``eta`` per frame, the boolean aperture ``mask``, the
+    masked ``mode``, ``aperture_diameter`` and ``omega_0``.
     """
-    wavefronts = np.asarray(wavefronts, dtype=np.complex128)
-    if wavefronts.ndim == 2:
-        wavefronts = wavefronts[None]
-    if wavefronts.ndim != 3:
+    if not hasattr(wavefronts, "shape") or not hasattr(wavefronts, "__getitem__"):
+        wavefronts = np.asarray(wavefronts)
+    if len(wavefronts.shape) == 2:
+        wavefronts = np.asarray(wavefronts)[None]
+    if len(wavefronts.shape) != 3:
         raise ValueError(f"Expected wavefronts with shape [frames, N, N], got {wavefronts.shape}")
 
-    grid_size = wavefronts.shape[-1] * float(pixel_scale)
+    n = int(wavefronts.shape[-1])
+    grid_size = n * float(pixel_scale)
     if aperture_diameter is None:
         aperture_diameter = grid_size
     if aperture_diameter > grid_size:
         raise ValueError(f"Aperture diameter {aperture_diameter} m exceeds grid size {grid_size} m")
 
-    mode, aperture_diameter, omega_0 = gaussian_fiber_mode(
-        wavefronts.shape[-2:], pixel_scale, a, aperture_diameter=aperture_diameter
-    )
-    radius_px = float(aperture_diameter) / (2.0 * float(pixel_scale))
-    mask = circular_mask(wavefronts.shape[-2:], radius=radius_px).astype(np.complex128)
-    dA = float(pixel_scale) ** 2
-    mode_masked = mode * mask
-    mode_power = float(np.sum(np.abs(mode) ** 2) * dA)
-    masked = wavefronts * mask[None, :, :]
-    wavefront_power = np.sum(np.abs(masked) ** 2, axis=(-2, -1)) * dA
-    overlaps = np.sum(masked * np.conj(mode_masked), axis=(-2, -1)) * dA
-    denominator = wavefront_power * mode_power
-    eta = np.divide(
-        np.abs(overlaps) ** 2,
-        denominator,
-        out=np.full_like(wavefront_power, np.nan, dtype=np.float64),
-        where=denominator > 0,
-    )
+    k = _coupling_kernel(n, float(pixel_scale), float(a), float(aperture_diameter))
+    box, mask_box, conj_mode, dA = k["box"], k["mask_box"], k["conj_mode_box"], k["dA"]
+    T = int(wavefronts.shape[0])
+    sliceable = isinstance(wavefronts, np.ndarray)
+    if batch_size is None:
+        # complex128 copy + float64/complex128 temporaries over the aperture box,
+        # plus the full frames when the source cannot be cropped on read.
+        per_frame = conj_mode.size * 48 + (0 if sliceable else n * n * wavefronts.dtype.itemsize)
+        batch_size = max(1, int(max_batch_bytes // per_frame))
+    eta = np.empty(T, dtype=np.float64)
+    for i in range(0, T, int(batch_size)):
+        if sliceable:
+            chunk = np.asarray(wavefronts[i:i + int(batch_size), box[0], box[1]])
+        else:
+            chunk = np.asarray(wavefronts[i:i + int(batch_size)])[:, box[0], box[1]]
+        chunk = chunk.astype(np.complex128)
+        wavefront_power = np.sum(np.abs(chunk) ** 2 * mask_box, axis=(-2, -1)) * dA
+        overlaps = np.sum(chunk * conj_mode, axis=(-2, -1)) * dA
+        denominator = wavefront_power * k["mode_power"]
+        eta[i:i + len(chunk)] = np.divide(
+            np.abs(overlaps) ** 2,
+            denominator,
+            out=np.full_like(wavefront_power, np.nan, dtype=np.float64),
+            where=denominator > 0,
+        )
     return {
         "eta": np.clip(eta, 0.0, 1.0),
-        "mask": mask,
-        "mode": mode_masked,
-        "aperture_diameter": float(aperture_diameter),
-        "omega_0": float(omega_0),
+        "mask": k["mask"],
+        "mode": k["mode_masked"],
+        "aperture_diameter": k["aperture_diameter"],
+        "omega_0": k["omega_0"],
         "dA": dA,
     }
 
