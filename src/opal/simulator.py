@@ -83,9 +83,13 @@ class GpuSimulator(tf.Module):
     log_dir : str or os.PathLike, optional
         If given, the layer geometry and diagnostics are logged to
         ``<log_dir>/opal.log``.
+    progress : callable, optional
+        ``progress(i, n, r0)`` is called before layer ``i`` of ``n`` is built.
+        Building a layer computes its extrusion operators on the CPU
+        (covariance, Cholesky and SVD), which dominates start-up at large N.
     """
 
-    def __init__(self, config, name=None, seed=None, log_dir=None):
+    def __init__(self, config, name=None, seed=None, log_dir=None, progress=None):
         super().__init__(name=name)
 
         config = normalize_config(config)
@@ -114,12 +118,14 @@ class GpuSimulator(tf.Module):
             number_of_layers=self.num_layers,
             whole_simulation_time=self.simulation_time,
             per_tick_simulation=self.per_tick_simulation,
-            satellite_orbit=float(channel_params["satellite_orbit"]["value"]),
+            satellite_orbit=float(channel_params["satellite_orbit_altitude"]["value"]),
             ground_wind_speed=float(channel_params["ground_wind_speed"]["value"]),
-            satellite_zenith_angle_starting=float(channel_params["satellite_zenith"]["value"]),
+            satellite_zenith_angle_starting=float(channel_params["satellite_zenith_angle"]["value"]),
             L0=float(channel_params["L0"]["value"]),
             seed=self.seed,
+            on_layer=progress,
         )
+        self.geometry.on_layer = None
 
         self.log_dir = None if log_dir is None else os.fspath(log_dir)
         self.logger = self._setup_logger()
@@ -149,8 +155,11 @@ class GpuSimulator(tf.Module):
         self._offload_runtime = _HostOffloadRuntime()
         self._host_capture_runtime = _HostCaptureRuntime()
 
+        # Rows are extruded whole: every layer's v*dt/dx is multiplied so the
+        # lowest layer moves at least one row per tick, then rounded up.
         first_extr = self.geometry.number_extrusions_array_per_tick[0]
         extrusion_mult = np.ceil(1 / first_extr) if first_extr < 1 else np.ceil(first_extr)
+        self.extrusion_multiplier = int(extrusion_mult)
         self.tf_extr_per_tick = tf.constant(
             np.ceil(
                 extrusion_mult
@@ -184,7 +193,18 @@ class GpuSimulator(tf.Module):
         return json.loads(self._config_json)
 
     def describe(self):
-        """Summary of the channel: grid, seeds and the per-layer profile."""
+        """Summary of the channel: grid, seeds and the per-layer profile.
+
+        Per layer, ``rows_per_tick`` is the physical ``v*dt/dx`` and
+        ``rows_extruded`` the whole number of rows the engine actually extrudes
+        each tick (``ceil(extrusion_multiplier * rows_per_tick)``), so
+        ``effective_wind_mps`` is the speed the screens really move at.
+        """
+        rows_used = self.tf_extr_per_tick.numpy().astype(int).tolist()
+        layers = self.geometry.describe()
+        for layer, rows in zip(layers, rows_used):
+            layer["rows_extruded"] = int(rows)
+            layer["effective_wind_mps"] = rows * self.px_delta / self.per_tick_simulation
         return {
             "seed": self.seed,
             "grid": self.nx_size,
@@ -194,8 +214,10 @@ class GpuSimulator(tf.Module):
             "D_over_r0": self.nx_size * self.px_delta / self.total_r0,
             "num_layers": self.num_layers,
             "time_per_tick_s": self.per_tick_simulation,
-            "rows_per_tick": self.tf_extr_per_tick.numpy().astype(int).tolist(),
-            "layers": self.geometry.describe(),
+            "extrusion_multiplier": self.extrusion_multiplier,
+            "rows_per_tick": rows_used,
+            "rows_per_tick_total": int(sum(rows_used)),
+            "layers": layers,
         }
 
     def reseed(self, seed=None):

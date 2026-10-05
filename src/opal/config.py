@@ -15,6 +15,7 @@ object. Internally everything is normalised to the ``{"value": ...}`` form.
 from __future__ import annotations
 
 import copy
+import difflib
 import hashlib
 import json
 import os
@@ -22,10 +23,13 @@ from typing import Any, Mapping
 
 __all__ = [
     "DEFAULTS",
+    "PASS_DEFAULTS",
     "ALIASES",
+    "RENAMED_KEYS",
     "load_config",
     "normalize_config",
     "validate_config",
+    "rename_legacy_keys",
     "to_plain",
     "get_value",
     "set_value",
@@ -49,10 +53,22 @@ DEFAULTS: dict[str, dict[str, tuple[Any, str]]] = {
         "wavefront_wavelength": (1.55e-6, "Optical wavelength (m)."),
         "L0": (25.0, "Von Karman outer scale (m)."),
         "ground_wind_speed": (5.0, "Ground wind speed in the Bufton model (m/s)."),
-        "satellite_orbit": (6e5, "Circular-orbit altitude (m); sets the slew-induced wind."),
-        "satellite_zenith": (0.0, "Zenith angle (deg) at which the slew rate is evaluated."),
+        "satellite_orbit_altitude": (6e5, "Circular-orbit altitude of the satellite (m); sets the "
+                                          "slew-induced wind."),
+        "satellite_zenith_angle": (0.0, "Zenith angle of the line of sight (deg, 0 = overhead) at which "
+                                        "the satellite's slew rate (apparent wind) is evaluated. It does "
+                                        "not rescale total_r0 or the propagation distances."),
     },
 }
+
+# Keys renamed in OPAL 1.1. Old names are rejected with a pointer to the new one.
+RENAMED_KEYS: dict[str, str] = {
+    "satellite_orbit": "satellite_orbit_altitude",
+    "satellite_zenith": "satellite_zenith_angle",
+}
+
+# Top-level sections that are accepted and ignored (legacy AtmoTurbSim files).
+IGNORED_SECTIONS = {"save_data"}
 
 PASS_DEFAULTS: dict[str, Any] = {
     "altitude_m": None,
@@ -89,10 +105,10 @@ ALIASES: dict[str, tuple[str, str]] = {
     "L0": ("channel_params", "L0"),
     "wind": ("channel_params", "ground_wind_speed"),
     "ground_wind_speed": ("channel_params", "ground_wind_speed"),
-    "orbit": ("channel_params", "satellite_orbit"),
-    "satellite_orbit": ("channel_params", "satellite_orbit"),
-    "zenith": ("channel_params", "satellite_zenith"),
-    "satellite_zenith": ("channel_params", "satellite_zenith"),
+    "orbit": ("channel_params", "satellite_orbit_altitude"),
+    "satellite_orbit_altitude": ("channel_params", "satellite_orbit_altitude"),
+    "zenith": ("channel_params", "satellite_zenith_angle"),
+    "satellite_zenith_angle": ("channel_params", "satellite_zenith_angle"),
 }
 
 _INT_KEYS = {"num_steps", "phase_screen_size", "num_layers", "seed"}
@@ -107,22 +123,63 @@ def _unwrap(v):
 def _coerce(key, value):
     if value is None:
         return None
-    if key in _INT_KEYS:
+    if isinstance(value, bool):
+        if key in _INT_KEYS:
+            raise ValueError(f"{key} must be an integer, got {value!r}")
+        return value
+    try:
         f = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} must be a number, got {value!r}") from None
+    if key in _INT_KEYS:
         if not f.is_integer():
             raise ValueError(f"{key} must be an integer, got {value!r}")
         return int(f)
-    if isinstance(value, bool):
-        return value
-    return float(value)
+    return f
+
+
+def _unknown_key_error(where, key, known):
+    path = f"{where}{key}"
+    if key in RENAMED_KEYS:
+        return ValueError(f"{path!r} was renamed to {where + RENAMED_KEYS[key]!r} in OPAL 1.1; "
+                          "please update your config")
+    hint = difflib.get_close_matches(key, list(known), n=1, cutoff=0.6)
+    if hint:
+        return ValueError(f"Unknown parameter {path!r}; did you mean {where + hint[0]!r}?")
+    return ValueError(f"Unknown parameter {path!r}. Known: {', '.join(sorted(known))}")
+
+
+def _check_keys(config: Mapping) -> None:
+    """Reject misspelled sections and parameters instead of silently ignoring them."""
+    known_sections = set(DEFAULTS) | _PASSTHROUGH
+    for section in config:
+        if section in known_sections or section in IGNORED_SECTIONS or str(section).startswith("_"):
+            continue
+        hint = difflib.get_close_matches(str(section), sorted(known_sections), n=1, cutoff=0.6)
+        raise ValueError(f"Unknown config section {section!r}"
+                         + (f"; did you mean {hint[0]!r}?" if hint else
+                            f". Known: {', '.join(sorted(known_sections))}"))
+    for section, params in DEFAULTS.items():
+        for key in (config.get(section) or {}):
+            if key not in params and not str(key).startswith("_"):
+                raise _unknown_key_error(f"{section}.", key, params)
+    for key in (config.get("pass_params") or {}):
+        if key not in PASS_DEFAULTS and not str(key).startswith("_"):
+            raise _unknown_key_error("pass_params.", key, PASS_DEFAULTS)
+
+
+_PASSTHROUGH = {"pass_params", "dataset", "analysis"}
 
 
 def normalize_config(config: Mapping) -> dict:
     """Return a new config in ``{"value": ...}`` form with defaults filled in.
 
-    Unknown sections (e.g. ``pass_params``, ``dataset``) are kept with plain
-    values. Legacy AtmoTurbSim sections such as ``save_data`` are ignored.
+    ``pass_params``, ``dataset`` and ``analysis`` are kept with plain values.
+    Unknown sections or parameters raise ``ValueError`` (with a "did you mean"
+    hint); keys starting with ``_`` (comments) and the legacy AtmoTurbSim
+    ``save_data`` section are ignored.
     """
+    _check_keys(config)
     out: dict = {}
     for section, params in DEFAULTS.items():
         src = config.get(section, {}) or {}
@@ -138,14 +195,29 @@ def normalize_config(config: Mapping) -> dict:
             sec_out[key] = {"value": value, "description": description}
         out[section] = sec_out
 
-    passthrough = {"pass_params", "dataset", "analysis"}
-    for section in passthrough:
+    for section in _PASSTHROUGH:
         if section in config and config[section] is not None:
-            out[section] = {k: _unwrap(v) for k, v in config[section].items()}
+            out[section] = {k: _unwrap(v) for k, v in config[section].items()
+                            if not str(k).startswith("_")}
     if "pass_params" in out:
         merged = dict(PASS_DEFAULTS)
         merged.update(out["pass_params"])
         out["pass_params"] = merged
+    return out
+
+
+def rename_legacy_keys(config: Mapping) -> dict:
+    """Copy of a stored (plain or ``{"value"}``) config with pre-1.1 key names updated.
+
+    Used when reading manifests and exports written by OPAL 1.0. User configs
+    are not migrated silently; :func:`load_config` rejects the old names.
+    """
+    out = copy.deepcopy(dict(config))
+    ch = out.get("channel_params")
+    if isinstance(ch, dict):
+        for old, new in RENAMED_KEYS.items():
+            if old in ch and new not in ch:
+                ch[new] = ch.pop(old)
     return out
 
 
@@ -160,16 +232,16 @@ def validate_config(config: Mapping) -> None:
         raise ValueError("num_layers must be >= 1")
     if sim["num_steps"]["value"] < 1:
         raise ValueError("num_steps must be >= 1")
-    for key in ("pixel_size", "total_r0", "wavefront_wavelength", "L0", "satellite_orbit"):
+    for key in ("pixel_size", "total_r0", "wavefront_wavelength", "L0", "satellite_orbit_altitude"):
         if not ch[key]["value"] > 0:
             raise ValueError(f"{key} must be > 0, got {ch[key]['value']}")
     if not sim["time_per_tick"]["value"] > 0:
         raise ValueError("time_per_tick must be > 0")
     if ch["ground_wind_speed"]["value"] < 0:
         raise ValueError("ground_wind_speed must be >= 0")
-    z = ch["satellite_zenith"]["value"]
+    z = ch["satellite_zenith_angle"]["value"]
     if not 0 <= z < 90:
-        raise ValueError(f"satellite_zenith must be in [0, 90) deg, got {z}")
+        raise ValueError(f"satellite_zenith_angle must be in [0, 90) deg, got {z}")
     seed = sim["seed"]["value"]
     if seed is not None and not 0 <= seed < 2**63:
         raise ValueError("seed must be a non-negative integer")
@@ -203,8 +275,16 @@ def _resolve(key: str) -> tuple[str, str]:
         return ALIASES[key]
     if "." in key:
         section, name = key.split(".", 1)
+        if section in DEFAULTS and name not in DEFAULTS[section]:
+            raise KeyError(str(_unknown_key_error(f"{section}.", name, DEFAULTS[section])))
+        if section == "pass_params" and name not in PASS_DEFAULTS:
+            raise KeyError(str(_unknown_key_error("pass_params.", name, PASS_DEFAULTS)))
         return section, name
-    raise KeyError(f"Unknown parameter {key!r}. Known: {sorted(ALIASES)}")
+    if key in RENAMED_KEYS:
+        raise KeyError(str(_unknown_key_error("", key, ALIASES)))
+    hint = difflib.get_close_matches(key, sorted(ALIASES), n=1, cutoff=0.6)
+    raise KeyError(f"Unknown parameter {key!r}"
+                   + (f"; did you mean {hint[0]!r}?" if hint else f". Known: {sorted(ALIASES)}"))
 
 
 def apply_overrides(config: dict, overrides: Mapping | None) -> dict:
@@ -220,13 +300,16 @@ def load_config(source, overrides: Mapping | None = None, validate: bool = True)
 
     Parameters
     ----------
-    source : str, os.PathLike or Mapping
-        Path to a JSON file or an already-loaded dict.
+    source : str, os.PathLike, Mapping or None
+        Path to a JSON file, an already-loaded dict, or ``None`` for the
+        built-in defaults.
     overrides : Mapping, optional
         ``{alias_or_path: value}`` applied after loading, e.g.
         ``{"r0": 0.1, "steps": 500}``.
     """
-    if isinstance(source, (str, os.PathLike)):
+    if source is None:
+        raw = {}
+    elif isinstance(source, (str, os.PathLike)):
         with open(source, "r", encoding="utf-8") as fh:
             raw = json.load(fh)
     else:

@@ -21,6 +21,7 @@ from pathlib import Path
 
 import numpy as np
 
+from . import _timing
 from . import memory as mem
 from ._version import __version__
 from .analysis.pass_geometry import (
@@ -67,7 +68,7 @@ def plan_pass(config):
     num_segments = int(pp["num_segments"])
     if num_steps % num_segments:
         raise ValueError(f"num_steps ({num_steps}) must be a multiple of num_segments ({num_segments})")
-    altitude = float(pp.get("altitude_m") or ch["satellite_orbit"])
+    altitude = float(pp.get("altitude_m") or ch["satellite_orbit_altitude"])
 
     orbit = circular_orbit_pass(altitude, float(pp["min_elevation_deg"]), int(pp["pass_num_samples"]))
     orbit = truncate_pass_to_window(orbit, pp.get("pass_window_s"))
@@ -75,7 +76,7 @@ def plan_pass(config):
         num_layers=int(ch["num_layers"]),
         wavelength=float(ch["wavefront_wavelength"]),
         ground_wind_speed=float(ch["ground_wind_speed"]),
-        satellite_orbit=float(ch["satellite_orbit"]),
+        satellite_orbit=float(ch["satellite_orbit_altitude"]),
         total_r0_zenith=float(ch["total_r0"]),
     )
     per_layer = per_layer_r0_along_pass(zenith, orbit.zenith_angle_deg)
@@ -117,9 +118,10 @@ def run_pass(config, out_dir=None, *, seed=None, simulator=None, measure_r0=True
     dict with ``plan``, ``records`` (per capture), ``segments``, ``wavefronts``
     (array or memmap) and ``manifest``.
     """
+    from .runners import warn_if_no_gpu
     from .simulator import GpuSimulator
 
-    t0 = time.time()
+    t0 = _timing.clock()
 
     def say(msg):
         if log is not None:
@@ -142,11 +144,18 @@ def run_pass(config, out_dir=None, *, seed=None, simulator=None, measure_r0=True
         f"{orbit.elevation_deg.max():.1f} deg over {orbit.duration_s:.0f} s")
     say(f"schedule: {plan.schedule.shape[0]} segments x {plan.segment_steps} steps = {plan.num_steps}, "
         f"path r0 {np.nanmin(plan.effective_r0_t):.3f}-{np.nanmax(plan.effective_r0_t):.3f} m, "
-        f"{len(plan.wavefront_steps)} wavefront captures")
+        f"{len(plan.wavefront_steps)} wavefront captures"
+        + (f" (requested {int(pp['wavefront_captures'])}; at most one per tick)"
+           if int(pp["wavefront_captures"]) > len(plan.wavefront_steps) else ""))
 
+    warn_if_no_gpu(say)
+    build_s = None
     if simulator is None:
-        say("building simulator")
-        simulator = GpuSimulator(config, seed=seed)
+        say(f"building simulator: N={N}, {int(ch['num_layers'])} layers")
+        tb = time.time()
+        simulator = GpuSimulator(config, seed=seed, progress=_timing.layer_progress(say, N))
+        build_s = time.time() - tb
+        say(f"built simulator in {build_s:.1f} s")
     say(f"seed {simulator.seed}")
 
     wf_store = None
@@ -228,7 +237,7 @@ def run_pass(config, out_dir=None, *, seed=None, simulator=None, measure_r0=True
 
     ratio = np.array([r["measured_r0"] / r["theoretical_r0"] for r in records
                       if np.isfinite(r["measured_r0"]) and r["theoretical_r0"] > 0])
-    say(f"done: {plan.num_steps} steps in {run_time:.1f} s | peak GPU {peak / mem.GIB:.2f} GiB"
+    say(f"done: {plan.num_steps} steps in {run_time:.1f} s | peak GPU {mem.format_bytes(peak)}"
         + (f" | measured/theory r0 median {np.median(ratio):.3f}" if ratio.size else ""))
 
     manifest = {
@@ -247,9 +256,12 @@ def run_pass(config, out_dir=None, *, seed=None, simulator=None, measure_r0=True
         "switch_time_s": float(sum(m["switch_time_s"] for m in result["per_segment_metadata"])),
         "gpu_peak_bytes": peak,
         "r0_ratio_median": float(np.median(ratio)) if ratio.size else None,
+        "timing": {"build_s": None if build_s is None else round(build_s, 3),
+                   "simulate_s": round(run_time, 3)},
         "files": {},
     }
     if out_dir is not None:
+        t_write = time.time()
         wf_store.flush()
         with (out_dir / "r0_tracking.csv").open("w", newline="", encoding="utf-8") as fh:
             writer = csv.DictWriter(fh, fieldnames=list(records[0].keys()))
@@ -262,6 +274,10 @@ def run_pass(config, out_dir=None, *, seed=None, simulator=None, measure_r0=True
         manifest["files"] = {"wavefronts": "wavefronts.npy", "wavefront_steps": "wavefront_steps.npy",
                              "schedule": "schedule.npz", "r0_tracking": "r0_tracking.csv",
                              "segments": "segments.csv"}
+        manifest["timing"]["write_s"] = round(time.time() - t_write, 3)
+    if _timing.started() is not None:
+        manifest["timing"]["since_process_start_s"] = round(time.time() - _timing.started(), 3)
+    if out_dir is not None:
         (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         say(f"wrote {out_dir}")
     return {"plan": plan, "records": records, "segments": segments, "wavefronts": wf_store,

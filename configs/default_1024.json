@@ -12,7 +12,7 @@
     "wavefront_wavelength": 1.55e-06,
     "L0": 25.0,
     "ground_wind_speed": 5.0,
-    "satellite_orbit": 600000.0,
-    "satellite_zenith": 0.0
+    "satellite_orbit_altitude": 600000.0,
+    "satellite_zenith_angle": 0.0
   }
 }

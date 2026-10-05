@@ -27,8 +27,10 @@ from pathlib import Path
 import numpy as np
 import tensorflow as tf
 
+from . import _timing
 from . import memory as mem
 from ._version import __version__
+from .frames import iter_frames, load_frames, open_frames  # noqa: F401  (re-exported)
 
 __all__ = [
     "RunResult",
@@ -39,10 +41,12 @@ __all__ = [
     "build_schedule",
     "load_frames",
     "iter_frames",
+    "open_frames",
     "save_npy",
+    "warn_if_no_gpu",
 ]
 
-SCHEDULE_KINDS = ("b_scale", "cn2", "r0")
+SCHEDULE_KINDS = ("b_scale", "cn2", "r0", "path_r0")
 
 
 # ----------------------------------------------------------------------
@@ -81,11 +85,15 @@ def _write_json(path, payload):
 
 
 class _Log:
-    """Timestamped console reporter (``log=None`` silences it)."""
+    """Timestamped console reporter (``log=None`` silences it).
 
-    def __init__(self, sink):
+    Timestamps count from the process start when the CLI set it
+    (:mod:`opal._timing`), otherwise from the creation of this reporter.
+    """
+
+    def __init__(self, sink, t0=None):
         self.sink = sink
-        self.t0 = time.time()
+        self.t0 = _timing.clock(t0)
 
     def __call__(self, msg):
         if self.sink is None:
@@ -95,6 +103,21 @@ class _Log:
 
 def _default_sink(line):
     print(line, flush=True)
+
+
+_GPU_WARNED = False
+
+
+def warn_if_no_gpu(log):
+    """Log a loud warning (once per process) when TensorFlow sees no GPU; it silently uses the CPU."""
+    global _GPU_WARNED
+    if not tf.config.list_physical_devices("GPU"):
+        if not _GPU_WARNED:
+            log("WARNING: TensorFlow sees no GPU - running on the CPU, typically 10-100x slower. "
+                "Run `opal info` and see the README install notes (CUDA/cuDNN on PATH).")
+            _GPU_WARNED = True
+        return False
+    return True
 
 
 # ----------------------------------------------------------------------
@@ -139,7 +162,11 @@ def load_state(simulator, path):
 # Turbulence-strength schedules
 # ----------------------------------------------------------------------
 def load_schedule(path):
-    """Load a ``[steps, layers]`` schedule from ``.npy``, ``.npz``, ``.json`` or ``.csv``."""
+    """Load a schedule array from ``.npy``, ``.npz``, ``.json`` or ``.csv``.
+
+    The array is returned as stored (0-, 1- or 2-D); :func:`build_schedule`
+    decides how it maps onto ticks and layers.
+    """
     path = Path(path)
     suffix = path.suffix.lower()
     if suffix == ".npy":
@@ -155,10 +182,8 @@ def load_schedule(path):
     else:
         raise ValueError(f"Unsupported schedule file type: {path}")
     data = np.asarray(data, dtype=np.float32)
-    if data.ndim == 1:
-        data = data.reshape(1, -1)
-    if data.ndim != 2:
-        raise ValueError("A schedule must have shape [steps, layers].")
+    if data.ndim > 2:
+        raise ValueError(f"A schedule must have shape [steps, layers]; {path} has shape {data.shape}.")
     return data
 
 
@@ -168,34 +193,62 @@ def build_schedule(schedule, num_steps, num_layers, base_r0=None, kind="b_scale"
     Parameters
     ----------
     schedule : None, array-like or path
-        ``[steps, layers]`` values (a single row is held constant). Shorter
-        schedules hold their last row; longer ones are truncated.
-    kind : {"b_scale", "cn2", "r0"}
+        ``[steps, layers]`` values, one row per tick and one column per
+        layer. A single row is held constant for the whole run; shorter
+        schedules hold their last row; longer ones are truncated. A single
+        column ``[steps, 1]`` applies the same value to every layer. A 1-D
+        array of length ``layers`` is one constant row; any other 1-D length
+        is a per-tick series applied to every layer. A scalar is constant.
+    kind : {"b_scale", "cn2", "r0", "path_r0"}
         ``b_scale``: innovation multiplier b (Cn^2 scales by b^2).
         ``cn2``: Cn^2 multiplier m (b = sqrt(m)).
         ``r0``: absolute per-layer r0 in metres (b = (r0_base / r0)^(5/6)).
+        ``path_r0``: total path r0 in metres, one value per tick (shape
+        ``[steps]`` or ``[steps, 1]``); every layer is scaled by the same
+        b = (r0_path_base / r0_path)^(5/6).
+    base_r0 : array-like, optional
+        The simulator's per-layer r0 (needed for ``r0`` and ``path_r0``).
     """
+    if kind not in SCHEDULE_KINDS:
+        raise ValueError(f"Unknown schedule kind {kind!r}; choose from {SCHEDULE_KINDS}")
     if schedule is None:
         return np.ones((num_steps, num_layers), dtype=np.float32)
     if isinstance(schedule, (str, os.PathLike)):
         schedule = load_schedule(schedule)
     schedule = np.asarray(schedule, dtype=np.float32)
-    if schedule.ndim == 1:
-        schedule = schedule.reshape(1, -1)
+    if schedule.ndim == 0:
+        schedule = schedule.reshape(1, 1)
+    elif schedule.ndim == 1:
+        per_layer_row = schedule.size == num_layers and kind != "path_r0"
+        schedule = schedule.reshape(1, -1) if per_layer_row else schedule.reshape(-1, 1)
+    if schedule.ndim != 2 or schedule.shape[0] == 0:
+        raise ValueError(f"A schedule must have shape [steps, layers]; got {schedule.shape}.")
+    if kind == "path_r0" and schedule.shape[1] != 1:
+        raise ValueError(f"kind='path_r0' takes one path r0 per tick, shape [steps] or [steps, 1]; got {schedule.shape}.")
+    if schedule.shape[1] == 1 and num_layers > 1:
+        schedule = np.repeat(schedule, num_layers, axis=1)
     if schedule.shape[1] != num_layers:
-        raise ValueError(f"Schedule has {schedule.shape[1]} layers, simulator has {num_layers}.")
+        raise ValueError(
+            f"Schedule has shape {schedule.shape} ({schedule.shape[1]} layer columns) but the simulator has "
+            f"{num_layers} layers. Use [steps, {num_layers}], [steps, 1] or a 1-D per-tick series for all layers."
+        )
+    positive = kind in ("cn2", "r0", "path_r0")
+    if not np.all(np.isfinite(schedule)) or np.any(schedule <= 0 if positive else schedule < 0):
+        raise ValueError(f"Schedule values must be finite and {'positive' if positive else 'non-negative'} "
+                         f"for kind={kind!r}.")
 
     if kind == "b_scale":
         out = schedule
     elif kind == "cn2":
-        out = np.sqrt(np.maximum(schedule, 1e-24))
-    elif kind == "r0":
-        if base_r0 is None:
-            raise ValueError("kind='r0' needs the base per-layer r0 array")
-        base = np.asarray(base_r0, dtype=np.float32).reshape(1, -1)
-        out = np.power(base / np.maximum(schedule, 1e-24), 5.0 / 6.0)
+        out = np.sqrt(schedule)
     else:
-        raise ValueError(f"Unknown schedule kind {kind!r}; choose from {SCHEDULE_KINDS}")
+        if base_r0 is None:
+            raise ValueError(f"kind={kind!r} needs the simulator's per-layer r0 (base_r0)")
+        base = np.asarray(base_r0, dtype=np.float64).reshape(1, -1)
+        if kind == "path_r0":
+            ok = np.isfinite(base) & (base > 0)
+            base = np.full_like(base, np.sum(base[ok] ** (-5.0 / 3.0)) ** (-3.0 / 5.0))
+        out = np.power(base / schedule.astype(np.float64), 5.0 / 6.0)
 
     if out.shape[0] > num_steps:
         out = out[:num_steps]
@@ -237,51 +290,10 @@ def save_npy(path, array, max_write_bytes=256 * mem.MIB):
 
 def _clear_frame_outputs(out_dir):
     for pattern in ("frames.npy", "frames.npy.tmp", "frames_chunk_*.npy", "frames_chunk_*.npy.tmp",
-                    "frames_chunk_manifest.json", "final_frame.npy"):
+                    "frames_chunk_manifest.json", "final_frame.npy", "schedule.npy", "captures.npz"):
         for p in Path(out_dir).glob(pattern):
             if p.is_file():
                 p.unlink()
-
-
-def load_frames(run_dir, mmap=True):
-    """Load the frames of a run directory as one ``[T, N, N]`` array.
-
-    Device/host runs are memory-mapped (no RAM cost). Chunked runs are
-    concatenated, so prefer :func:`iter_frames` for very large ones.
-    """
-    run_dir = Path(run_dir)
-    single = run_dir / "frames.npy"
-    if single.exists():
-        return np.load(single, mmap_mode="r" if mmap else None)
-    manifest = run_dir / "frames_chunk_manifest.json"
-    if manifest.exists():
-        chunks = json.loads(manifest.read_text(encoding="utf-8"))["chunks"]
-        return np.concatenate([np.load(run_dir / Path(c["file"]).name) for c in chunks], axis=0)
-    final = run_dir / "final_frame.npy"
-    if final.exists():
-        return np.load(final)[None]
-    raise FileNotFoundError(f"No frames found in {run_dir}")
-
-
-def iter_frames(run_dir, stride=1):
-    """Yield ``(step, frame)`` from any run directory without loading it all."""
-    run_dir = Path(run_dir)
-    single = run_dir / "frames.npy"
-    if single.exists():
-        frames = np.load(single, mmap_mode="r")
-        for t in range(0, frames.shape[0], stride):
-            yield t, np.asarray(frames[t])
-        return
-    manifest = run_dir / "frames_chunk_manifest.json"
-    if manifest.exists():
-        chunks = json.loads(manifest.read_text(encoding="utf-8"))["chunks"]
-        for c in chunks:
-            frames = np.load(run_dir / Path(c["file"]).name, mmap_mode="r")
-            for t in range(c["start_step"], c["end_step_exclusive"]):
-                if t % stride == 0:
-                    yield t, np.asarray(frames[t - c["start_step"]])
-        return
-    raise FileNotFoundError(f"No frame series found in {run_dir}")
 
 
 # ----------------------------------------------------------------------
@@ -328,13 +340,15 @@ def _run_device(sim, T, sched, captures, out_dir, log):
     run_time = time.time() - start
     log(f"device: {T} steps in {run_time:.2f} s ({1e3 * run_time / T:.2f} ms/step)")
     files = {}
+    write_time = 0.0
     if out_dir is not None:
         w = save_npy(Path(out_dir) / "frames.npy", frames)
+        write_time = w["write_time_s"]
         files["frames"] = "frames.npy"
-        log(f"wrote frames.npy ({frames.nbytes / mem.GIB:.2f} GiB) in {w['write_time_s']:.1f} s")
+        log(f"wrote frames.npy ({frames.nbytes / mem.GIB:.2f} GiB) in {write_time:.1f} s")
         frames = np.load(Path(out_dir) / "frames.npy", mmap_mode="r")
     return {"frames": frames, "final_frame": np.asarray(frames[-1]), "captures": cap,
-            "run_time_s": run_time, "files": files}
+            "run_time_s": run_time, "write_time_s": write_time, "files": files}
 
 
 def _run_host(sim, T, sched, captures, out_dir, log):
@@ -365,34 +379,52 @@ def _run_host(sim, T, sched, captures, out_dir, log):
     if captures:
         cap = {k: v for k, v in res.items() if k != "frames"}
 
+    write_time = 0.0
     if out_dir is not None:
+        # The frames were written into a memory-mapped file while running; the
+        # OS may still hold part of it in RAM, and flushing it can take a while.
+        w0 = time.time()
         frames.flush()
         del frames
         if final_path.exists():
             final_path.unlink()
         tmp_path.replace(final_path)
+        write_time = time.time() - w0
         frames = np.load(final_path, mmap_mode="r")
         files["frames"] = "frames.npy"
+        log(f"wrote frames.npy ({frames.nbytes / mem.GIB:.2f} GiB): final flush to disk took "
+            f"{write_time:.1f} s")
     return {"frames": frames, "final_frame": np.asarray(frames[-1]), "captures": cap,
-            "run_time_s": run_time, "files": files}
+            "run_time_s": run_time, "write_time_s": write_time, "files": files}
 
 
-def _run_chunked(sim, T, sched, chunk, out_dir, log):
+def _run_chunked(sim, T, sched, chunk, out_dir, log, captures=None):
     chunk = max(1, int(chunk))
     records = []
     pending = None
     last = None
+    write_wait = 0.0
+    caps = []
     start = time.time()
     with ThreadPoolExecutor(max_workers=1) as pool:
         for idx, s0 in enumerate(range(0, T, chunk)):
             s1 = min(s0 + chunk, T)
             c0 = time.time()
-            arr = _np(sim.simulate_steps(tf.constant(s1 - s0, dtype=tf.int32),
-                                         tf.convert_to_tensor(sched[s0:s1], dtype=tf.float32)))
+            n = tf.constant(s1 - s0, dtype=tf.int32)
+            s = tf.convert_to_tensor(sched[s0:s1], dtype=tf.float32)
+            local = [c - s0 for c in (captures or []) if s0 <= c < s1]
+            if local:
+                res = _np(sim.simulate_steps_capture(n, s, tf.convert_to_tensor(local, dtype=tf.int32)))
+                arr = res.pop("frames")
+                caps.append({k: res[k] for k in ("captured_screens", "captured_r0", "captured_b_scales")})
+            else:
+                arr = _np(sim.simulate_steps(n, s))
             compute = time.time() - c0
             last = arr[-1].copy()
             if pending is not None:
+                w0 = time.time()
                 pending.result()
+                write_wait += time.time() - w0
             rec = {"index": idx, "start_step": s0, "end_step_exclusive": s1, "steps": s1 - s0,
                    "compute_time_s": compute, "file": None}
             if out_dir is not None:
@@ -404,7 +436,9 @@ def _run_chunked(sim, T, sched, chunk, out_dir, log):
                 f"({(s1 - s0) / max(compute, 1e-9):.1f} steps/s)"
                 + (f" -> {rec['file']}" if rec["file"] else " (not saved)"))
         if pending is not None:
+            w0 = time.time()
             pending.result()
+            write_wait += time.time() - w0
     run_time = time.time() - start
     files = {}
     if out_dir is not None:
@@ -412,8 +446,15 @@ def _run_chunked(sim, T, sched, chunk, out_dir, log):
                     {"total_steps": T, "chunk_size": chunk, "dtype": "complex64",
                      "frame_shape": [int(sim.nx_size)] * 2, "chunks": records})
         files["chunks"] = "frames_chunk_manifest.json"
-    return {"frames": None, "final_frame": last, "captures": None, "run_time_s": run_time,
-            "files": files, "chunks": records}
+        log(f"chunked: {len(records)} chunk files written; waiting on disk writes took {write_wait:.1f} s "
+            "(writes overlap with the next chunk's compute)")
+    # run_time includes the write waits here; report them separately.
+    cap = None
+    if caps:
+        cap = {k: np.concatenate([c[k] for c in caps]) for k in caps[0]}
+        cap["capture_indices"] = np.asarray(captures, dtype=np.int32)
+    return {"frames": None, "final_frame": last, "captures": cap, "run_time_s": run_time - write_wait,
+            "write_time_s": write_wait, "files": files, "chunks": records}
 
 
 def _run_no_save(sim, T, sched, out_dir, log):
@@ -427,7 +468,7 @@ def _run_no_save(sim, T, sched, out_dir, log):
         np.save(Path(out_dir) / "final_frame.npy", final)
         files["final_frame"] = "final_frame.npy"
     return {"frames": None, "final_frame": final, "captures": None, "run_time_s": run_time,
-            "files": files}
+            "write_time_s": 0.0, "files": files}
 
 
 def _is_oom(exc):
@@ -447,6 +488,7 @@ def run(
     state_in=None,
     state_out=None,
     log=_default_sink,
+    timing=None,
 ):
     """Run a simulation in the requested (or automatically chosen) mode.
 
@@ -466,30 +508,43 @@ def run(
         Requested chunk length for ``chunked`` (capped by the guard).
     capture_indices : sequence of int, optional
         Ticks at which to also capture all layer screens and r0 values
-        (device and host modes).
+        (device, host and chunked modes; written to ``captures.npz``).
     state_in : path, optional
         Start from a checkpoint instead of the base state.
     state_out : path, optional
         Write the final state here so a later run can continue bit-exactly.
     log : callable or None
         Line sink for progress messages (default: print).
+    timing : dict, optional
+        Earlier phases to record in the manifest's ``timing`` block, e.g.
+        ``{"startup_s": ..., "build_s": ...}`` (the CLI passes these).
     """
     log = _Log(log)
+    t_run = time.time()
     T = int(num_steps if num_steps is not None else simulator.steps)
     if T < 1:
         raise ValueError("num_steps must be >= 1")
     L = int(simulator.num_layers)
     N = int(simulator.nx_size)
     live = hasattr(simulator, "simulate_steps_offload")
+    warn_if_no_gpu(log)
 
     if out_dir is not None:
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
+        old = [p.name for p in sorted(out_dir.glob("frames*.npy")) + sorted(out_dir.glob("final_frame.npy"))]
+        if old:
+            shown = ", ".join(old[:3]) + (f" (+{len(old) - 3} more)" if len(old) > 3 else "")
+            log(f"note: {out_dir} already holds a run; replacing {shown}")
         _clear_frame_outputs(out_dir)
 
     base_r0 = _np(simulator.get_state())["base_r0"]
     sched = build_schedule(schedule, T, L, base_r0=base_r0, kind=schedule_kind)
-    captures = sorted({int(i) for i in (capture_indices or []) if 0 <= int(i) < T})
+    requested = sorted({int(i) for i in (capture_indices or [])})
+    captures = [i for i in requested if 0 <= i < T]
+    if len(captures) < len(requested):
+        log(f"note: capture ticks {[i for i in requested if not 0 <= i < T]} are outside 0..{T - 1} "
+            "and are ignored")
 
     baseline = mem.measure_baseline_peak_bytes(simulator)
     estimate = mem.estimate_memory(T, N, baseline, requested_chunk_size=chunk_size)
@@ -499,6 +554,13 @@ def run(
         log(line)
     if reason != "requested":
         log(f"guard: {reason}")
+    ram = estimate["host_ram_available"]
+    if selected == "host" and out_dir is not None and ram and estimate["full_output_bytes"] > 0.5 * ram:
+        log(f"note: the {estimate['full_output_bytes'] / mem.GIB:.2f} GiB output is written through a "
+            f"memory-mapped file and {ram / mem.GIB:.2f} GiB RAM is available; the OS writes it back to "
+            "disk while running, so later steps can slow down and the final flush can take a while. "
+            "--mode chunked writes bounded files instead.")
+    t_plan = time.time() - t_run
 
     current, chunk_now = selected, (chunk or min(int(chunk_size), T))
     fallbacks = []
@@ -519,10 +581,14 @@ def run(
             elif current == "host":
                 res = _run_host(simulator, T, sched, captures, out_dir, log)
             elif current == "chunked":
-                if captures:
-                    log("chunked mode does not collect captures; use device or host mode for them")
-                res = _run_chunked(simulator, T, sched, chunk_now, out_dir, log)
+                can_capture = hasattr(simulator, "simulate_steps_capture")
+                if captures and not can_capture:
+                    log("note: this model has no capture graph; captures are skipped")
+                res = _run_chunked(simulator, T, sched, chunk_now, out_dir, log,
+                                   captures=captures if can_capture else None)
             else:
+                if captures:
+                    log("note: no_save mode does not collect captures; use device, host or chunked mode")
                 res = _run_no_save(simulator, T, sched, out_dir, log)
             break
         except Exception as exc:  # noqa: BLE001
@@ -548,9 +614,18 @@ def run(
     mem_after = mem.memory_sample()
     peak = mem.memory_info()["peak"]
     run_time = res["run_time_s"]
+    write_time = float(res.get("write_time_s", 0.0))
     end_step = int(_np(simulator.get_state())["global_step"])
-    log(f"done: {T} steps in {run_time:.2f} s | {T / max(run_time, 1e-9):.1f} steps/s | "
-        f"peak GPU {peak / mem.GIB:.2f} GiB")
+    log(f"done: {T} steps simulated in {run_time:.2f} s | {T / max(run_time, 1e-9):.1f} steps/s | "
+        f"peak GPU {mem.format_bytes(peak)}"
+        + (f" | writing frames {write_time:.1f} s" if write_time >= 0.05 else ""))
+    warnings_out = []
+    if res["final_frame"] is not None and not np.all(np.isfinite(res["final_frame"])):
+        warnings_out.append(
+            "the final frame contains non-finite values: a layer's extrusion diverged, which happens when "
+            "the outer scale is too large for the pixel scale. The frames of this run are not valid; lower "
+            "channel_params.L0 or use a coarser channel_params.pixel_size.")
+        log("WARNING: " + warnings_out[-1])
 
     files = dict(res["files"])
     if state_out is not None:
@@ -567,12 +642,18 @@ def run(
                  captured_b_scales=cap["captured_b_scales"])
         files["captures"] = "captures.npz"
 
+    if out_dir is not None and schedule is not None:
+        np.save(out_dir / "schedule.npy", sched)
+        files["schedule"] = "schedule.npy"
+
     config = getattr(simulator, "config", None)
+    channel = simulator.describe() if hasattr(simulator, "describe") else None
     manifest = {
         "opal_version": __version__,
         "created": _dt.datetime.now().isoformat(timespec="seconds"),
         "seed": getattr(simulator, "seed", None),
         "config": config,
+        "channel": channel,
         "grid": N,
         "num_layers": L,
         "num_steps": T,
@@ -588,6 +669,7 @@ def run(
         "fallbacks": fallbacks,
         "run_time_s": run_time,
         "steps_per_second": T / max(run_time, 1e-9),
+        "timing": None,
         "gpu": {"name": mem.gpu_name(), "total_bytes": estimate["gpu_total_bytes"],
                 "baseline_peak_bytes": baseline, "run_peak_bytes": peak,
                 "before": mem_before, "after": mem_after},
@@ -595,13 +677,23 @@ def run(
         "schedule": {"kind": schedule_kind,
                      "source": str(schedule) if isinstance(schedule, (str, os.PathLike)) else
                      ("array" if schedule is not None else None),
-                     "constant": bool(np.all(sched == sched[0]))},
+                     "constant": bool(np.all(sched == sched[0])),
+                     "file": "schedule.npy (applied b_scale, [steps, layers])"
+                     if out_dir is not None and schedule is not None else None},
         "capture_indices": captures,
         "state_in": str(state_in) if state_in is not None else None,
         "files": files,
+        "warnings": warnings_out,
     }
     if "chunks" in res:
         manifest["chunks"] = res["chunks"]
+    t_end = time.time()
+    timing_block = {k: round(float(v), 3) for k, v in (timing or {}).items() if v is not None}
+    timing_block.update(plan_s=round(t_plan, 3), simulate_s=round(run_time, 3),
+                        write_frames_s=round(write_time, 3), run_call_s=round(t_end - t_run, 3))
+    if _timing.started() is not None:
+        timing_block["since_process_start_s"] = round(t_end - _timing.started(), 3)
+    manifest["timing"] = timing_block
     if out_dir is not None:
         _write_json(out_dir / "manifest.json", manifest)
         log(f"wrote {out_dir / 'manifest.json'}")

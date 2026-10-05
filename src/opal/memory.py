@@ -44,6 +44,7 @@ __all__ = [
     "estimate_memory",
     "select_mode",
     "format_plan",
+    "format_bytes",
 ]
 
 GIB = 1024**3
@@ -53,6 +54,12 @@ DEFAULT_CHUNK_SIZE = 100
 MAX_CHUNK_FILE_BYTES = 800 * MIB
 HOST_RAM_FRACTION = 0.6
 MODES = ("auto", "device", "host", "chunked", "no_save")
+
+
+def format_bytes(n):
+    """``1.23 GiB``, or ``4.7 MiB`` below 0.01 GiB (so small runs do not print 0.00 GiB)."""
+    n = float(n or 0)
+    return f"{n / GIB:.2f} GiB" if n >= 0.01 * GIB else f"{n / MIB:.1f} MiB"
 
 
 def setup_tensorflow(require_gpu=True):
@@ -246,7 +253,10 @@ def select_mode(requested, estimate, *, live=True, has_output_dir=False):
     if requested == "host" and host_ok:
         return "host", 0, "requested"
     if requested == "chunked" and chunk_ok:
-        return "chunked", estimate["chunk_steps"], "requested"
+        return "chunked", estimate["chunk_steps"], (
+            "requested" if has_output_dir else
+            "chunked mode without an output directory: chunks are simulated and discarded "
+            "(only the final frame is kept)")
 
     chain = {
         "auto": ("device", "host", "chunked"),
@@ -254,14 +264,24 @@ def select_mode(requested, estimate, *, live=True, has_output_dir=False):
         "host": ("device", "chunked"),
         "chunked": (),
     }[requested]
+    if requested == "auto":
+        why = "auto"
+    elif requested == "host" and not live:
+        why = "host mode needs a live simulator (an exported SavedModel cannot stream frames)"
+    elif requested == "host" and not (has_output_dir or fits_ram):
+        why = "host mode: the output fits neither in RAM nor (without -o) on disk"
+    elif requested == "chunked" and not has_output_dir:
+        why = "chunked mode needs an output directory"
+    else:
+        why = f"{requested} mode would not fit in memory"
     for mode in chain:
         if mode == "device" and device_ok:
-            return "device", 0, "auto: full output fits on the GPU"
+            return "device", 0, f"{why}: full output fits on the GPU -> device"
         if mode == "host" and host_ok:
-            return "host", 0, "auto: streaming frames to host keeps GPU memory flat"
+            return "host", 0, f"{why}: streaming frames to host keeps GPU memory flat -> host"
         if mode == "chunked" and chunk_ok and has_output_dir:
-            return "chunked", estimate["chunk_steps"], "auto: output exceeds host RAM, streaming chunks to disk"
-    return "no_save", 0, "no safe mode can keep the frames; running without saving"
+            return "chunked", estimate["chunk_steps"], f"{why}: output exceeds host RAM, streaming chunks to disk -> chunked"
+    return "no_save", 0, f"{why}: no safe mode can keep the frames; running without saving"
 
 
 def format_plan(estimate, requested, selected, chunk_size=0):
