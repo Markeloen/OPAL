@@ -17,6 +17,9 @@ opal_runs/
 *.npz
 *.npy.tmp
 
+# Jupyter
+.ipynb_checkpoints/
+
 # Editors / OS
 .vscode/
 .idea/
