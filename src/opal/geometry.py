@@ -58,6 +58,7 @@ class GPUGeometry:
     satellite_zenith_angle_starting: float = 90
     L0: float = 50
     seed: int | None = None
+    on_layer: object = field(default=None, repr=False, compare=False)
     r0_array: list = field(default_factory=list, init=False)
     layer_height_array: list = field(default_factory=list, init=False)
     wind_profile_array: list = field(default_factory=list, init=False)
@@ -83,6 +84,8 @@ class GPUGeometry:
         self.layer_seeds = derive_layer_seeds(self.seed, self.number_of_layers)
 
         for i in range(self.number_of_layers):
+            if self.on_layer is not None:
+                self.on_layer(i, self.number_of_layers, float(self.r0_array[i]))
             self.layer_object_array.append(
                 GpuLayer(
                     self.nx_size,
