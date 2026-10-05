@@ -83,6 +83,11 @@ timing, default output folders, a real viewer and a much more complete README.
   with an example, and a clearer explanation of turbulence schedules (what `b` is and why `b = (r0_base/r0)^(5/6)`).
   New sections cover analysis outputs, the viewer, the SavedModel, architecture, modifying the engine and
   low-RAM machines.
+- The examples are now Jupyter notebooks committed with their results (logs, plots and short GIFs), so they can be
+  read on GitHub without running anything. They replace the `examples/*.py` scripts. Two notebooks are new:
+  `07_cli_tour` (every `opal` command) and `08_turbulence_schedules`. The GIFs are stored in `examples/media/`
+  because GitHub does not render GIF cell outputs. A new `examples` extra (`pip install -e ".[examples]"`) installs
+  JupyterLab and Matplotlib. The CNN in `05_ml_dataset` is enabled with `TRAIN = True` instead of `--train`.
 
 ## 1.0.0
 

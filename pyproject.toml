@@ -41,6 +41,7 @@ dependencies = [
 # conda (see environment.yml), and pip would otherwise pull a CPU-only wheel.
 tf = ["tensorflow>=2.10"]
 viewer = ["matplotlib>=3.5"]
+examples = ["matplotlib>=3.5", "jupyterlab>=3"]
 all = ["tensorflow>=2.10", "matplotlib>=3.5", "gputil>=1.4"]
 
 [project.scripts]

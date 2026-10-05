@@ -106,7 +106,8 @@ opal run -c configs/quickstart_256.json --steps 50
 TensorFlow is an optional extra (`pip install -e ".[tf]"`) rather than a hard
 dependency, so pip never replaces a working GPU build with a CPU-only wheel.
 `matplotlib` is needed only for `opal view` and `analyze --plot`, and `ffmpeg`
-only for `.mp4` output (GIFs need nothing extra).
+only for `.mp4` output (GIFs need nothing extra). The example notebooks also
+need JupyterLab: `pip install -e ".[examples]"` ([section 16](#16-examples)).
 
 ---
 
@@ -277,7 +278,7 @@ A complete pass config (`configs/leo_pass_b2.json`):
   "simulation_params": { "num_steps": 3000, "time_per_tick": 0.001, "seed": 20260716 },
   "channel_params": {
     "phase_screen_size": 512, "pixel_size": 0.01, "num_layers": 10,
-    "total_r0": 0.2, "wavefront_wavelength": 1.55e-6, "L0": 25.0,
+    "total_r0": 0.25, "wavefront_wavelength": 1.55e-6, "L0": 25.0,
     "ground_wind_speed": 5.0,
     "satellite_orbit_altitude": 700000.0, "satellite_zenith_angle": 0.0
   },
@@ -285,9 +286,13 @@ A complete pass config (`configs/leo_pass_b2.json`):
     "altitude_m": 700000.0,
     "min_elevation_deg": 20.0,
     "num_segments": 30,
+    "pass_num_samples": 1024,
+    "pass_window_s": null,
     "wavefront_captures": 200,
+    "capture_to_host": true,
     "regenerate_on_switch": false,
-    "match_initial_r0": false
+    "match_initial_r0": true,
+    "validation_guard_frac": 0.0
   }
 }
 ```
@@ -689,10 +694,10 @@ The loaders refuse incomplete datasets and unknown targets or label keys with a
 clear message. `opal view datasets/r0_wind` browses the samples
 ([section 9](#9-visualization-opal-view)).
 
-`examples/05_ml_dataset.py --train` generates a small r₀ × wind dataset and fits
-a small CNN that reads r₀ off single wrapped-phase frames (fed as cos/sin). On
-held-out realizations it reaches ≈ 0.5 cm mean absolute error, against ≈ 2.7 cm
-for always predicting the mean.
+The optional last section of `examples/05_ml_dataset.ipynb` (set `TRAIN = True`)
+fits a small CNN that reads r₀ off single wrapped-phase frames (fed as cos/sin) of
+the notebook's r₀ × wind dataset. On held-out realizations it reaches ≈ 0.5 cm
+mean absolute error, against ≈ 2.7 cm for always predicting the mean.
 
 ---
 
@@ -775,7 +780,7 @@ most `--batch-mb` MiB (default 256), processed, and released. Analysing all
 
 The frames of a single run are correlated in time. For ensemble statistics, use
 independent realizations: `opal dataset -k K`, or `GpuSimulator.reseed` in a
-loop (see `examples/06_fiber_coupling.py`).
+loop (see `examples/06_fiber_coupling.ipynb`).
 
 ### 8.7 Python analysis functions
 
@@ -1100,10 +1105,11 @@ Inside the compiled graph (`GpuSimulator.simulate_steps` and its siblings):
 - **Randomness.** Each layer has its own `tf.random.Generator`. Do not draw
   random numbers from a global RNG, or results stop being reproducible from the
   seed.
-- **Check after a change:** run `examples/02_run_modes.py` (all modes must give
-  identical frames) and `examples/03_checkpoint_resume.py` (bit-exact
-  segmentation). Then compare `opal analyze r0` and `opal analyze fiber` with
-  theory on a run with known r₀.
+- **Check after a change:** re-run the notebooks `examples/02_run_modes.ipynb`
+  (all modes must give identical frames) and `examples/03_checkpoint_resume.ipynb`
+  (bit-exact segmentation), e.g. headless with
+  `jupyter nbconvert --to notebook --execute --inplace`. Then compare
+  `opal analyze r0` and `opal analyze fiber` with theory on a run with known r₀.
 
 ---
 
@@ -1154,17 +1160,40 @@ On the RTX 4080, with 10 layers at 1024²:
 
 ## 16. Examples
 
-| Script | Shows |
-|---|---|
-| `examples/01_quickstart.py` | Build, describe the layers, run, basic statistics |
-| `examples/02_run_modes.py` | Guard decisions; all four modes give identical frames; memory/throughput per mode |
-| `examples/03_checkpoint_resume.py` | 4 × 30 ticks == 1 × 120 ticks through a checkpoint file |
-| `examples/04_leo_pass_replacement.py` | Reduced LEO pass with exact r₀ switching and r₀ tracking |
-| `examples/05_ml_dataset.py [--train]` | r₀ × wind dataset; optional CNN that estimates r₀ from phase |
-| `examples/06_fiber_coupling.py` | Independent-realization fiber coupling vs von Kármán theory, with and without tip/tilt correction |
+The examples are Jupyter notebooks, saved with their outputs (console logs,
+plots and animations), so they can be read on GitHub without running anything.
 
-Run them from the repository root. Outputs go to `runs/`, which is ignored by
-git.
+| Notebook | Shows |
+|---|---|
+| [`01_quickstart`](examples/01_quickstart.ipynb) | Load a config, describe the layers, run, look at the frames, fiber coupling over the run |
+| [`02_run_modes`](examples/02_run_modes.ipynb) | Memory-guard dry run; the four modes give bit-identical frames; speed and GPU memory per mode; lazy reading |
+| [`03_checkpoint_resume`](examples/03_checkpoint_resume.ipynb) | 4 × 30 ticks == 1 × 120 ticks through a checkpoint; resuming in a fresh simulator |
+| [`04_leo_pass`](examples/04_leo_pass.ipynb) | Reduced LEO pass: plan, exact r₀ switching, measured vs target r₀, the captured wavefronts as a GIF |
+| [`05_ml_dataset`](examples/05_ml_dataset.ipynb) | r₀ × wind dataset, its labels against theory, the three loaders; optional CNN that estimates r₀ from phase |
+| [`06_fiber_coupling`](examples/06_fiber_coupling.ipynb) | Independent-realization fiber coupling vs von Kármán theory, with and without tip/tilt correction |
+| [`07_cli_tour`](examples/07_cli_tour.ipynb) | Every `opal` command: `info`, `config`, `plan`, `run`, `analyze`, `view`, `pass`, `dataset`, `export` |
+| [`08_turbulence_schedules`](examples/08_turbulence_schedules.ipynb) | An r₀ ramp with `--schedule`: the b values, measured r₀ vs target and the refresh lag, the four schedule kinds |
+
+To run them yourself, install Jupyter into the OPAL environment and open the
+notebooks in JupyterLab or VS Code with that environment as the kernel:
+
+```bash
+pip install -e ".[examples]"         # JupyterLab + matplotlib
+jupyter lab examples/
+```
+
+Each notebook starts by moving to the repository root, so outputs go to `runs/`
+(ignored by git) wherever it is opened from. To re-execute one headless and
+store the new outputs:
+
+```bash
+jupyter nbconvert --to notebook --execute --inplace examples/01_quickstart.ipynb
+```
+
+The stored outputs come from an RTX 4080 (16 GiB). Timings and the mode the
+memory guard picks differ on other GPUs; the statistics do not. Animations are
+written to `examples/media/` and shown from a markdown cell, because GitHub does
+not display GIF cell outputs.
 
 ---
 
