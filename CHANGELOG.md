@@ -76,7 +76,9 @@ timing, default output folders, a real viewer and a much more complete README.
 ### Changed
 
 - The simulator build is about 2× faster with bit-identical operators and screens (53 s → 25 s for 1024², 10 layers
-  on an RTX 4080 workstation). The float64 host operators are released once copied to the GPU.
+  on an RTX 4080 workstation). The r0 switch at each `opal pass` segment is about 3× faster for the same reason
+  (1024²: 53.9 s → 15.5 s per segment; 512²: ≈ 14 s → 5 s). The float64 host operators are released once copied to
+  the GPU.
 - The README is rewritten with numbered sections. It adds units for every parameter, a full `pass_params` reference
   with an example, and a clearer explanation of turbulence schedules (what `b` is and why `b = (r0_base/r0)^(5/6)`).
   New sections cover analysis outputs, the viewer, the SavedModel, architecture, modifying the engine and

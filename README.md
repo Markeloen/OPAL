@@ -453,7 +453,7 @@ strength while the simulation runs, in two ways:
 |---|---|---|
 | Resolution in time | every tick, every layer | per segment (e.g. 30 per pass) |
 | What changes | the strength of newly extruded rows (approximate statistics) | the extrusion operators themselves (exact von Kármán statistics at the new r₀) |
-| Cost | free (inside the compiled graph) | one CPU operator rebuild per layer per segment (≈ 14 s at 512²) |
+| Cost | free (inside the compiled graph) | one CPU operator rebuild per layer per segment (≈ 5 s at 512², ≈ 15 s at 1024², 10 layers) |
 | Use it for | fades, ramps, gusts, moderate changes in strength, quick what-ifs | full passes where r₀ changes by an order of magnitude |
 
 ### 5.1 Turbulence schedules
@@ -1111,11 +1111,14 @@ Inside the compiled graph (`GpuSimulator.simulate_steps` and its siblings):
 
 On the RTX 4080, with 10 layers at 1024²:
 
-- **Wall time:** t ≈ 0.123·T + 53.9·N<sub>seg</sub> s.
+- **Wall time:** t ≈ 0.123·T + 15.5·N<sub>seg</sub> s.
   - The first term is GPU propagation, per tick, through all planes, including
     screen extrusion.
   - The second is the per-segment operator rebuild of `opal pass`: a CPU
-    covariance build + SVD per layer. At 512² this is ≈ 14 s per segment.
+    covariance build + SVD per layer. At 512² this is ≈ 5 s per segment.
+    (OPAL 1.0, and the paper, needed 53.9 s at 1024² and ≈ 14 s at 512²; since
+    1.1 the r₀-independent part of the covariance is computed once and
+    reused.)
 - **Step time depends on rows, not pixels.** Each extruded row is one small
   matrix-vector product launched separately, so the step time grows with the
   total number of rows extruded per tick over all layers. It barely grows with
