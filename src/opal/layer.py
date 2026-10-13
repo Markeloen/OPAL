@@ -75,6 +75,8 @@ class GpuLayer(tf.Module):
             trainable=False,
             name="B_base",
         )
+        # The float64 host copies are no longer needed once on the device.
+        self._phase_screen_object.release_operators()
 
         self.tf_b_scale = tf.Variable(1.0, trainable=False, dtype=tf.float32, name="b_scale")
         self.tf_base_r0 = tf.Variable(float(r0), trainable=False, dtype=tf.float32, name="base_r0")
@@ -221,6 +223,7 @@ class GpuLayer(tf.Module):
             self.tf_base_scrn.assign(new_scrn)
             self.base_scrn_r0 = new_r0
 
+        new_ps.release_operators()
         self._phase_screen_object = new_ps
         self.r0 = new_r0
 
@@ -241,6 +244,7 @@ class GpuLayer(tf.Module):
         ps.random_seed = random_seed
         ps.make_initial_screen()
         screen = tf.cast(ps.scrn, tf.float32)
+        ps._scrn = None
         self.tf_scrn.assign(screen)
         self.tf_base_scrn.assign(screen)
         self.base_scrn_r0 = float(ps.r0)

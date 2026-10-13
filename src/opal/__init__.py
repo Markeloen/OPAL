@@ -23,8 +23,10 @@ _LAZY = {
     "save_state": ("runners", "save_state"),
     "load_state": ("runners", "load_state"),
     "build_schedule": ("runners", "build_schedule"),
-    "load_frames": ("runners", "load_frames"),
-    "iter_frames": ("runners", "iter_frames"),
+    "load_frames": ("frames", "load_frames"),
+    "iter_frames": ("frames", "iter_frames"),
+    "open_frames": ("frames", "open_frames"),
+    "FrameSeries": ("frames", "FrameSeries"),
     "export": ("savedmodel", "export"),
     "load": ("savedmodel", "load"),
     "run_pass": ("passes", "run_pass"),
@@ -33,10 +35,12 @@ _LAZY = {
     "load_dataset": ("dataset", "load_dataset"),
     "iter_samples": ("dataset", "iter_samples"),
     "as_tf_dataset": ("dataset", "as_tf_dataset"),
+    "analyze_run": ("analysis.runs", "analyze_run"),
+    "load_analysis": ("analysis.runs", "load_analysis"),
 }
 
-_SUBMODULES = {"analysis", "config", "dataset", "geometry", "layer", "memory", "passes", "phase_screens",
-               "profiles", "propagation", "runners", "savedmodel", "simulator", "viewer"}
+_SUBMODULES = {"analysis", "config", "dataset", "frames", "geometry", "layer", "memory", "passes",
+               "phase_screens", "profiles", "propagation", "runners", "savedmodel", "simulator", "viewer"}
 
 __all__ = ["__version__", "load_config", "save_config", *_LAZY]
 

@@ -15,7 +15,7 @@ authors:
     affiliation: "Department of Electrical and Computer Engineering, McMaster University"
 repository-code: "https://github.com/Markeloen/OPAL"
 license: MIT
-version: 1.0.0
+version: 1.1.0
 keywords:
   - atmospheric turbulence
   - free-space optical communication

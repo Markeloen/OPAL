@@ -13,6 +13,10 @@ Two generators are provided:
   initial screen.
 """
 
+import os
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+
 import numba
 import numpy
 from scipy import linalg
@@ -23,28 +27,94 @@ from ._fft import ift2
 __all__ = [
     "PhaseScreenVonKarman",
     "phase_covariance",
+    "clear_kernel_cache",
     "ft_phase_screen",
     "ft_sh_phase_screen",
 ]
 
 
-def phase_covariance(r, r0, L0):
-    """Von Karman phase covariance at separation ``r`` (Assemat et al. 2006, Eq. 5)."""
+def _covariance_prefactor(r0, L0):
+    """r0-dependent scalar of the von Karman covariance."""
+    A = (float(L0) / float(r0)) ** (5.0 / 3)
+    B1 = (2 ** (-5.0 / 6)) * gamma(11.0 / 6) / (numpy.pi ** (8.0 / 3))
+    B2 = ((24.0 / 5) * gamma(6.0 / 5)) ** (5.0 / 6)
+    return A * B1 * B2
+
+
+def _covariance_shape(r, L0):
+    """r0-independent part of the von Karman covariance (the Bessel term)."""
     r = numpy.float32(r)
-    r0 = float(r0)
     L0 = float(L0)
 
     # Avoid the singularity of K_{5/6} at r = 0.
     r += 1e-40
 
-    A = (L0 / r0) ** (5.0 / 3)
+    return (((2 * numpy.pi * r) / L0) ** (5.0 / 6)) * kv(5.0 / 6, (2 * numpy.pi * r) / L0)
 
-    B1 = (2 ** (-5.0 / 6)) * gamma(11.0 / 6) / (numpy.pi ** (8.0 / 3))
-    B2 = ((24.0 / 5) * gamma(6.0 / 5)) ** (5.0 / 6)
 
-    C = (((2 * numpy.pi * r) / L0) ** (5.0 / 6)) * kv(5.0 / 6, (2 * numpy.pi * r) / L0)
+def phase_covariance(r, r0, L0):
+    """Von Karman phase covariance at separation ``r`` (Assemat et al. 2006, Eq. 5)."""
+    return _covariance_prefactor(r0, L0) * _covariance_shape(r, L0)
 
-    return A * B1 * B2 * C
+
+# The Bessel term over the stencil geometry depends only on (N, dx, L0), not
+# on r0, and dominates the operator build time. Every layer of a simulator
+# (and every r0 switch of a pass) shares it, so the last few are kept.
+_KERNEL_CACHE = {}
+_KERNEL_CACHE_SIZE = 2
+
+
+def _stencil_covariance_shape(key, positions, L0):
+    kernel = _KERNEL_CACHE.get(key)
+    if kernel is None:
+        separations = numpy.zeros((len(positions), len(positions)))
+        _calc_separations_fast(positions, separations)
+        kernel = _covariance_shape(separations, L0)
+        del separations
+        kernel.setflags(write=False)
+        while len(_KERNEL_CACHE) >= _KERNEL_CACHE_SIZE:
+            _KERNEL_CACHE.pop(next(iter(_KERNEL_CACHE)))
+        _KERNEL_CACHE[key] = kernel
+    return kernel
+
+
+def clear_kernel_cache():
+    """Release the cached covariance kernels (a few tens of MB per grid size)."""
+    _KERNEL_CACHE.clear()
+
+
+# Largest growth per extruded row accepted from the deterministic noise-free
+# extrusion test. Valid operators sit just below 1 (0.998-0.99999 depending on
+# L0/pixel); float32 round-off at too large an L0/pixel gives 1.01-4.5.
+_MAX_STABLE_GROWTH = 1.0002
+_STABILITY_ITERATIONS = 2000
+# Measured float32 limit of the outer scale in pixels: N = 128-2048 all give
+# stable operators up to L0/pixel = 2500; failures start at 3000 (N >= 512),
+# 4000 (N = 256) and 5000 (N = 128).
+_SAFE_L0_OVER_PIXEL = 2500
+
+
+def extrusion_growth_rate(A_mat, iterations=_STABILITY_ITERATIONS):
+    """Asymptotic growth per extruded row of the noise-free extrusion ``A``.
+
+    Power iteration on the companion map ``(row_0, ..., row_k) ->
+    (A @ stencil, row_0, ..., row_{k-1})`` from a fixed random start, in the
+    float32 precision the GPU uses. Values above 1 mean the screen diverges
+    (the extrusion is unstable). Costs about 0.25 s at N=1024.
+    """
+    A = numpy.asarray(A_mat, dtype=numpy.float32)
+    n = A.shape[0]
+    v = numpy.random.default_rng(12345).standard_normal(A.shape[1]).astype(numpy.float32)
+    v /= numpy.linalg.norm(v)
+    logs = numpy.empty(iterations)
+    for k in range(iterations):
+        v = numpy.concatenate([A @ v, v[:-n]])
+        norm = numpy.linalg.norm(v)
+        if not numpy.isfinite(norm) or norm == 0.0:
+            return float("inf") if not numpy.isfinite(norm) else 0.0
+        v /= norm
+        logs[k] = numpy.log(norm)
+    return float(numpy.exp(logs[iterations // 2:].mean()))
 
 
 @numba.jit(nopython=True, parallel=True)
@@ -97,11 +167,11 @@ class PhaseScreenVonKarman:
         self.set_X_coords()
         self.set_stencil_coords()
 
-        self.calc_separations()
         self.make_covmats()
 
         self.makeAMatrix()
         self.makeBMatrix()
+        self._release_scratch()
         if initial_screen:
             self.make_initial_screen()
 
@@ -127,8 +197,18 @@ class PhaseScreenVonKarman:
         _calc_separations_fast(positions, self.separations)
 
     def make_covmats(self):
-        """Covariance blocks between the stencil (z) and the new row (x)."""
-        self.cov_mat = phase_covariance(self.separations, self.r0, self.L0)
+        """Covariance blocks between the stencil (z) and the new row (x).
+
+        The r0-independent Bessel term is cached per geometry, so building
+        several layers (or switching r0 during a pass) computes it once.
+        """
+        positions = numpy.append(self.stencil_positions, self.X_positions, axis=0)
+        key = (
+            int(self.nx_size), int(self.stencil_length), int(self.n_columns),
+            float(self.pixel_scale), float(self.L0),
+        )
+        shape = _stencil_covariance_shape(key, positions, self.L0)
+        self.cov_mat = _covariance_prefactor(self.r0, self.L0) * shape
 
         self.cov_mat_zz = self.cov_mat[: self.n_stencils, : self.n_stencils]
         self.cov_mat_xx = self.cov_mat[self.n_stencils:, self.n_stencils:]
@@ -136,17 +216,41 @@ class PhaseScreenVonKarman:
         self.cov_mat_xz = self.cov_mat[self.n_stencils:, : self.n_stencils]
 
     def makeAMatrix(self):
-        """A = Cov_xz Cov_zz^-1 (Cholesky solve)."""
+        """A = Cov_xz Cov_zz^-1 (Cholesky solve), checked for stability.
+
+        The covariance is evaluated in float32, as in the reference
+        implementation. When L0 is large compared with the pixel scale the
+        stencil covariance becomes too ill-conditioned for that precision:
+        the factorization either fails, or it "succeeds" with an operator whose
+        extrusion grows without bound (screens overflow to NaN after a few
+        hundred rows). Both cases raise a ``LinAlgError`` that says which
+        numbers to change, instead of producing invalid screens.
+        """
         try:
             cf = linalg.cho_factor(self.cov_mat_zz)
-            inv_cov_zz = linalg.cho_solve(cf, numpy.identity(self.cov_mat_zz.shape[0]))
         except linalg.LinAlgError:
-            raise linalg.LinAlgError(
-                "Could not invert the stencil covariance matrix to build the A and B "
-                "operators. Try a larger pixel scale or a smaller L0."
-            )
+            raise self._operator_error("the stencil covariance cannot be factored") from None
+        inv_cov_zz = linalg.cho_solve(cf, numpy.identity(self.cov_mat_zz.shape[0]))
 
         self.A_mat = self.cov_mat_xz.dot(inv_cov_zz)
+
+        growth = extrusion_growth_rate(self.A_mat)
+        if not growth <= _MAX_STABLE_GROWTH:
+            raise self._operator_error(
+                f"the extrusion operator is unstable (rows grow by x{growth:.4g} per extruded row)"
+            )
+
+    def _operator_error(self, reason):
+        ratio = float(self.L0) / float(self.pixel_scale)
+        suggested = float(f"{_SAFE_L0_OVER_PIXEL * float(self.pixel_scale):.2g}")
+        return linalg.LinAlgError(
+            f"Cannot build the extrusion operators for a layer with r0={self.r0:.4g} m: {reason}. "
+            f"The outer scale is too large for the pixel scale (L0={self.L0:g} m, pixel scale "
+            f"{self.pixel_scale:g} m, L0/pixel={ratio:.0f}, N={self.nx_size}); the extrusion covariance "
+            f"is then numerically singular. Change the numbers: lower L0 (channel_params.L0) to about "
+            f"{suggested:g} m or less (L0/pixel <= {_SAFE_L0_OVER_PIXEL}), or use a coarser pixel scale "
+            "(channel_params.pixel_size)."
+        )
 
     def makeBMatrix(self):
         """B B^T = Cov_xx - A Cov_zx, factored by SVD."""
@@ -158,6 +262,24 @@ class PhaseScreenVonKarman:
         numpy.fill_diagonal(L_mat, numpy.sqrt(W))
 
         self.B_mat = u.dot(L_mat)
+
+    def _release_scratch(self):
+        """Drop the covariance blocks once A and B exist (~110 MB at N=1024)."""
+        self.cov_mat = self.cov_mat_zz = self.cov_mat_xx = None
+        self.cov_mat_zx = self.cov_mat_xz = None
+        self.separations = None
+        self.stencil = None
+
+    def release_operators(self):
+        """Drop the host copies of ``A``, ``B`` and the screen.
+
+        Used by :class:`opal.layer.GpuLayer` once they live on the GPU. The
+        CPU reference :meth:`add_row` needs them, so call this only when the
+        object is no longer used for CPU extrusion.
+        """
+        self.A_mat = None
+        self.B_mat = None
+        self._scrn = None
 
     def make_initial_screen(self):
         """Draw the initial screen from an FFT screen with sub-harmonics.
@@ -191,6 +313,25 @@ class PhaseScreenVonKarman:
         return self._scrn[: self.requested_nx_size, : self.requested_nx_size]
 
 
+def _subharmonic_workers(N, budget_bytes=512 * 2**20):
+    """Threads for the sub-harmonic terms, bounded by a transient-memory budget."""
+    if N < 256:
+        return 1
+    per_term = N * N * 16 * 3  # complex128 argument, exponential and product
+    return int(max(1, min(9, os.cpu_count() or 1, budget_bytes // per_term)))
+
+
+def _ordered_map(pool, fn, items, window):
+    """``map`` over a thread pool with at most ``window`` results in flight."""
+    pending = deque()
+    for item in items:
+        pending.append(pool.submit(fn, item))
+        if len(pending) >= window:
+            yield pending.popleft().result()
+    while pending:
+        yield pending.popleft().result()
+
+
 def ft_sh_phase_screen(r0, N, delta, L0, l0, FFT=None, seed=None):
     """Von Karman FFT phase screen with sub-harmonics (Schmidt 2010, Listing 9.3).
 
@@ -222,27 +363,42 @@ def ft_sh_phase_screen(r0, N, delta, L0, l0, FFT=None, seed=None):
 
     phs_lo = numpy.zeros(phs_hi.shape)
 
-    # Three-by-three frequency grids with spacing 1/(3^p D).
-    for p in range(1, 6):
-        del_f = 1 / (3**p * D)
-        fx = numpy.arange(-1, 2) * del_f
+    # The 9 sub-harmonic terms per level are independent full-size complex
+    # exponentials; NumPy releases the GIL, so they are evaluated in threads
+    # and summed in the original order (bit-identical to a serial loop).
+    workers = _subharmonic_workers(N)
+    pool = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+    try:
+        # Three-by-three frequency grids with spacing 1/(3^p D).
+        for p in range(1, 6):
+            del_f = 1 / (3**p * D)
+            fx = numpy.arange(-1, 2) * del_f
 
-        fx, fy = numpy.meshgrid(fx, fx)
-        f = numpy.sqrt(fx**2 + fy**2)
+            fx, fy = numpy.meshgrid(fx, fx)
+            f = numpy.sqrt(fx**2 + fy**2)
 
-        fm = 5.92 / l0 / (2 * numpy.pi)
-        f0 = 1.0 / L0
+            fm = 5.92 / l0 / (2 * numpy.pi)
+            f0 = 1.0 / L0
 
-        PSD_phi = 0.023 * r0 ** (-5.0 / 3) * numpy.exp(-1 * (f / fm) ** 2) / ((f**2 + f0**2) ** (11.0 / 6))
-        PSD_phi[1, 1] = 0
+            PSD_phi = 0.023 * r0 ** (-5.0 / 3) * numpy.exp(-1 * (f / fm) ** 2) / ((f**2 + f0**2) ** (11.0 / 6))
+            PSD_phi[1, 1] = 0
 
-        cn = (R.normal(size=(3, 3)) + 1j * R.normal(size=(3, 3))) * numpy.sqrt(PSD_phi) * del_f
-        SH = numpy.zeros((N, N), dtype="complex")
-        for i in range(0, 3):
-            for j in range(0, 3):
-                SH += cn[i, j] * numpy.exp(1j * 2 * numpy.pi * (fx[i, j] * x + fy[i, j] * y))
+            cn = (R.normal(size=(3, 3)) + 1j * R.normal(size=(3, 3))) * numpy.sqrt(PSD_phi) * del_f
 
-        phs_lo = phs_lo + SH
+            def term(ij, cn=cn, fx=fx, fy=fy):
+                i, j = ij
+                return cn[i, j] * numpy.exp(1j * 2 * numpy.pi * (fx[i, j] * x + fy[i, j] * y))
+
+            ij = [(i, j) for i in range(0, 3) for j in range(0, 3)]
+            SH = numpy.zeros((N, N), dtype="complex")
+            terms = _ordered_map(pool, term, ij, workers) if pool is not None else map(term, ij)
+            for t in terms:
+                SH += t
+
+            phs_lo = phs_lo + SH
+    finally:
+        if pool is not None:
+            pool.shutdown()
 
     phs_lo = phs_lo.real - phs_lo.real.mean()
 

@@ -18,7 +18,8 @@ seed ``SeedSequence([base_seed, p, r])``.
 Layout::
 
     out_dir/
-      manifest.json         config, sweep, seeds, targets, timing
+      manifest.json         config, sweep, seeds, targets, timing; "status" is
+                            "incomplete" until every sample is written
       labels.csv            one row per sample
       samples/sample_00000.npz
         field | intensity | phase   [F, n, n]
@@ -40,11 +41,12 @@ from pathlib import Path
 
 import numpy as np
 
+from . import _timing
 from ._version import __version__
 from .analysis.fiber import compute_fiber_coupling
 from .analysis.r0 import estimate_r0_from_wavefront
 from .analysis.stats import aperture_mask, scintillation_index, tilt_centroid
-from .config import ALIASES, get_value, load_config, set_value, to_plain
+from .config import ALIASES, get_value, load_config, rename_legacy_keys, set_value, to_plain
 
 __all__ = [
     "parse_sweep",
@@ -221,15 +223,21 @@ def generate_dataset(
     compress : bool
         Use ``np.savez_compressed`` for samples.
     resume : bool
-        Skip samples whose file already exists (seeds are deterministic).
+        Skip samples whose file already exists (seeds are deterministic). Raises
+        ``ValueError`` if ``out_dir`` holds a dataset generated with different
+        settings. ``False`` deletes existing samples first.
     """
+    from .runners import warn_if_no_gpu
     from .simulator import GpuSimulator
 
-    t0 = time.time()
+    t0 = _timing.clock()
+    t_start = time.time()
 
     def say(msg):
         if log is not None:
             log(f"[opal {time.time() - t0:7.2f}s] {msg}")
+
+    warn_if_no_gpu(say)
 
     base = load_config(config)
     targets = tuple(targets)
@@ -249,14 +257,52 @@ def generate_dataset(
     parsed = [parse_sweep(s) for s in (sweep or [])]
     total = len(points) * realizations
     out_dir = Path(out_dir)
-    (out_dir / "samples").mkdir(parents=True, exist_ok=True)
+    samples_dir = out_dir / "samples"
     saver = np.savez_compressed if compress else np.savez
+    n_frames = len(range(0, T, stride))
+
+    manifest = {
+        "opal_version": __version__,
+        "created": _dt.datetime.now().isoformat(timespec="seconds"),
+        "status": "incomplete",
+        "base_seed": seed,
+        "seed_rule": "SeedSequence([base_seed, point, realization]).generate_state(1)[0] & 0x7FFFFFFF",
+        "config": to_plain(base),
+        "sweep": {k: v for k, v in parsed},
+        "points": points,
+        "realizations": realizations,
+        "num_samples": total,
+        "num_steps": T,
+        "stride": stride,
+        "crop": int(crop) if crop else None,
+        "targets": list(targets),
+        "per_frame_labels": {"eta": "fiber coupling efficiency", "scint": "scintillation index",
+                             "tilt": "angle of arrival (rad), far-field centroid"},
+        "label_aperture_m": label_aperture,
+        "r0_frames": int(r0_frames),
+    }
+    manifest_path = out_dir / "manifest.json"
+    existing = sorted(samples_dir.glob("sample_*.npz")) if samples_dir.is_dir() else []
+    if resume and manifest_path.exists():
+        diff = _settings_diff(json.loads(manifest_path.read_text(encoding="utf-8")), manifest)
+        if diff:
+            raise ValueError(
+                f"{out_dir} already holds a dataset generated with different settings ({'; '.join(diff)}). "
+                "Resuming would mix incompatible samples: re-run with the original settings, pass "
+                "--no-resume (resume=False) to replace it, or choose another output directory.")
+    if not resume and existing:
+        for path in existing:
+            path.unlink()
+        say(f"--no-resume: removed {len(existing)} existing samples from {samples_dir}")
+    samples_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     say(f"dataset: {len(points)} sweep points x {realizations} realizations = {total} samples, "
-        f"{T} ticks (stride {stride}, {len(range(0, T, stride))} frames), targets {', '.join(targets)}")
+        f"{T} ticks (stride {stride}, {n_frames} frames), targets {', '.join(targets)}")
 
     rows = []
     sim_time = 0.0
+    resumed = 0
     idx = 0
     for p, point in enumerate(points):
         cfg = _apply_point(base, point)
@@ -269,16 +315,32 @@ def generate_dataset(
         sim = None
         for r in range(realizations):
             s = sample_seed(seed, p, r)
-            path = out_dir / "samples" / f"sample_{idx:05d}.npz"
+            path = samples_dir / f"sample_{idx:05d}.npz"
             if resume and path.exists():
                 with np.load(path) as data:
                     row = json.loads(str(data["labels_json"]))
+                    stored = set(data.files)
+                expected = json.loads(json.dumps({
+                    "seed": s, "frames": n_frames, "stride": stride, "crop": int(crop) if crop else N,
+                    "label_aperture_m": aperture, **params, **{f"sweep_{k}": v for k, v in point.items()}}))
+                bad = [f"{k} {row.get(k)!r} != {v!r}" for k, v in expected.items() if row.get(k) != v]
+                bad += [f"target {t} missing" for t in targets if t not in stored]
+                if bad:
+                    raise ValueError(
+                        f"{path} was generated with different settings ({'; '.join(bad[:4])}). Resuming "
+                        "would mix incompatible samples: re-run with the original settings, pass "
+                        "--no-resume (resume=False) to replace them, or choose another output directory.")
                 rows.append(row)
+                resumed += 1
                 say(f"sample {idx + 1}/{total} exists, skipped")
                 idx += 1
                 continue
             if sim is None:
-                sim = GpuSimulator(cfg, seed=s)
+                say(f"building simulator: N={N}, {int(get_value(cfg, 'layers'))} layers")
+                tb = time.time()
+                sim = GpuSimulator(cfg, seed=s, progress=_timing.layer_progress(say, N))
+                say(f"built simulator in {time.time() - tb:.1f} s (reused for every realization "
+                    "of this sweep point via reseed)")
             else:
                 sim.reseed(s)
             writer = _SampleWriter(T, stride, int(crop) if crop else None, targets, N, dx,
@@ -330,28 +392,58 @@ def generate_dataset(
         w.writeheader()
         w.writerows(rows)
 
-    manifest = {
-        "opal_version": __version__,
-        "created": _dt.datetime.now().isoformat(timespec="seconds"),
-        "base_seed": seed,
-        "seed_rule": "SeedSequence([base_seed, point, realization]).generate_state(1)[0] & 0x7FFFFFFF",
-        "config": to_plain(base),
-        "sweep": {k: v for k, v in parsed},
-        "points": points,
-        "realizations": realizations,
-        "num_samples": total,
-        "num_steps": T,
-        "stride": stride,
-        "crop": int(crop) if crop else None,
-        "targets": list(targets),
-        "per_frame_labels": {"eta": "fiber coupling efficiency", "scint": "scintillation index",
-                             "tilt": "angle of arrival (rad), far-field centroid"},
-        "label_aperture_m": label_aperture,
-        "simulation_time_s": sim_time,
-        "wall_time_s": time.time() - t0,
-    }
-    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    say(f"done: {total} samples in {time.time() - t0:.1f} s (GPU simulation {sim_time:.1f} s) -> {out_dir}")
+    manifest.update(
+        status="complete",
+        samples_resumed=resumed,
+        simulation_time_s=sim_time,
+        wall_time_s=time.time() - t_start,
+    )
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    say(f"done: {total} samples in {time.time() - t_start:.1f} s (GPU simulation {sim_time:.1f} s"
+        + (f", {resumed} existing samples reused" if resumed else "") + f") -> {out_dir}")
+    return manifest
+
+
+_RESUME_KEYS = ("base_seed", "config", "sweep", "points", "realizations", "num_steps", "stride", "crop",
+                "targets", "label_aperture_m", "r0_frames")
+
+
+def _flatten(value, prefix=""):
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            out.update(_flatten(v, f"{prefix}{k}."))
+        return out
+    return {prefix.rstrip("."): value}
+
+
+def _settings_diff(old, new):
+    """Human-readable differences of the settings that determine the samples."""
+    norm = lambda v: json.loads(json.dumps(v))  # noqa: E731 - tuples -> lists, numpy scalars -> numbers
+    diffs = []
+    for key in _RESUME_KEYS:
+        if key not in old:
+            continue
+        a, b = norm(old[key]), norm(new[key])
+        if key == "config" and isinstance(a, dict):
+            a = rename_legacy_keys(a)
+        if a == b:
+            continue
+        if key == "config":
+            fa, fb = _flatten(a), _flatten(b)
+            keys = [k for k in sorted(set(fa) | set(fb)) if fa.get(k) != fb.get(k)]
+            diffs += [f"config {k}: {fa.get(k)!r} -> {fb.get(k)!r}" for k in keys[:4]]
+        else:
+            diffs.append(f"{key}: {a!r} -> {b!r}"[:120])
+    return diffs
+
+
+def _read_manifest(ds_dir):
+    manifest = json.loads((Path(ds_dir) / "manifest.json").read_text(encoding="utf-8"))
+    if manifest.get("status") == "incomplete":
+        raise ValueError(
+            f"{ds_dir} is an incomplete dataset (generation was interrupted or is still running); re-run "
+            "the same `opal dataset` command to resume it, or load single files with load_sample().")
     return manifest
 
 
@@ -382,13 +474,25 @@ def load_sample(ds_dir, index):
 
 def iter_samples(ds_dir):
     """Yield every sample in index order."""
-    manifest = json.loads((Path(ds_dir) / "manifest.json").read_text(encoding="utf-8"))
+    manifest = _read_manifest(ds_dir)
     for i in range(int(manifest["num_samples"])):
         yield load_sample(ds_dir, i)
 
 
+def _check_request(ds_dir, manifest, target, label_keys, per_frame_keys=()):
+    stored = manifest.get("targets") or list(TARGETS)
+    if target not in stored:
+        raise ValueError(f"target {target!r} is not stored in {ds_dir} (it has: {', '.join(stored)}); "
+                         "generate the dataset with --targets including it")
+    labels = set(load_sample(ds_dir, 0)["labels"]) | set(per_frame_keys)
+    missing = [k for k in label_keys if k not in labels]
+    if missing:
+        raise ValueError(f"unknown label key(s) {missing}; available: {', '.join(sorted(labels))}")
+
+
 def load_dataset(ds_dir, target="intensity", label_keys=("r0", "eta_mean")):
     """Stack a whole dataset in memory: ``X [S, F, n, n]`` and ``y [S, len(label_keys)]``."""
+    _check_request(ds_dir, _read_manifest(ds_dir), target, label_keys)
     xs, ys = [], []
     for s in iter_samples(ds_dir):
         xs.append(s[target])
@@ -405,11 +509,12 @@ def as_tf_dataset(ds_dir, target="intensity", label_keys=("r0",), per_frame=Fals
     """
     import tensorflow as tf
 
-    manifest = json.loads((Path(ds_dir) / "manifest.json").read_text(encoding="utf-8"))
+    manifest = _read_manifest(ds_dir)
+    per_frame_keys = {"eta", "scint", "tilt_x", "tilt_y"}
+    _check_request(ds_dir, manifest, target, label_keys, per_frame_keys if per_frame else ())
     first = load_sample(ds_dir, 0)
     x_dtype = tf.complex64 if target == "field" else tf.float32
     shape = first[target].shape
-    per_frame_keys = {"eta", "scint", "tilt_x", "tilt_y"}
 
     def label_row(sample, f=None):
         vals = []

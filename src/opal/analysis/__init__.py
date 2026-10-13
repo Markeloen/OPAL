@@ -1,4 +1,4 @@
-"""TF-free analysis tools: r0 estimation, fiber coupling and pass geometry."""
+"""TF-free analysis tools: r0 estimation, fiber coupling, pass geometry and run analysis."""
 
 from .fiber import (
     circular_mask,
@@ -31,9 +31,12 @@ from .r0 import (
     structure_function_2d,
     von_karman_sf_coefficient,
 )
+from .runs import analyze_run, load_analysis
 from .stats import aperture_mask, scintillation_index, tilt_centroid
 
 __all__ = [
+    "analyze_run",
+    "load_analysis",
     "circular_mask",
     "compute_fiber_coupling",
     "coupling_efficiency_theoretical",

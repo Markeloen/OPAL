@@ -17,6 +17,7 @@ import numpy as np
 import tensorflow as tf
 
 from . import _tfsetup  # noqa: F401
+from .config import rename_legacy_keys
 from .simulator import saved_model_signatures
 
 __all__ = ["export", "load", "LoadedSimulator"]
@@ -68,7 +69,8 @@ class LoadedSimulator:
         self.nx_size = int(state["phase_screens"].shape[1])
         self.steps = int(self.meta.get("steps", 1000))
         self.seed = self.meta.get("seed")
-        self.config = self.meta.get("config")
+        config = self.meta.get("config")
+        self.config = rename_legacy_keys(config) if config else config
 
     def simulate_steps(self, num_steps, b_scale_schedule):
         return _out(self.signatures["simulate_steps"](

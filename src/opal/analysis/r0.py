@@ -156,6 +156,9 @@ def estimate_r0_from_structure_function(screen, pixel_scale, L0=None, fit_range_
 
 def _mcf_estimate(field, pixel_scale, aperture_diameter, L0):
     n = field.shape[0]
+    if not np.all(np.isfinite(field)):
+        return {"measured_r0": math.nan, "r_1e": math.nan,
+                "radial_mcf": np.array([], dtype=float), "mcf": None}
     if aperture_diameter is None:
         aperture_diameter = n * pixel_scale
     x = np.arange(-n / 2.0, n / 2.0)
@@ -163,7 +166,7 @@ def _mcf_estimate(field, pixel_scale, aperture_diameter, L0):
     mask = circ(nx * pixel_scale, ny * pixel_scale, aperture_diameter)
     mcf = corr2_ft(field, field, mask, pixel_scale)
     center = mcf[n // 2, n // 2]
-    if center == 0:
+    if center == 0 or not np.isfinite(center):
         return {"measured_r0": math.nan, "r_1e": math.nan,
                 "radial_mcf": np.array([], dtype=float), "mcf": mcf}
     normalized = np.abs(mcf / center)
